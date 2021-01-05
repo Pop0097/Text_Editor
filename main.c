@@ -1,3 +1,8 @@
+// Defines feature test macros so code is more portable 
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <errno.h>
 #include <ctype.h>
@@ -5,6 +10,7 @@
 #include <termios.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <string.h>
 
 // Gets ASCII value of Ctrl-k by setting bits 5-7 as 0
@@ -13,9 +19,16 @@
 #define APPENDBUFFER_INIT {NULL, 0}
 #define PROGRAM_VERSION "0.0.1B"
 
+// Stores a row of text
+typedef struct editorRow {
+    int size;
+    char *characters;
+} editorRow;  
+
 // Stores the configuration of the terminal and editor
 struct editorConfiguration {
-    int cursorX, cursorY, windowRows, windowCols;
+    int cursorX, cursorY, windowRows, windowCols, numRows;
+    editorRow *row;
     struct termios original_termios; 
 };
 
@@ -31,10 +44,17 @@ enum customKeyValues {
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
-    ARROW_DOWN
+    ARROW_DOWN,
+    PAGE_UP,
+    PAGE_DOWN,
+    HOME_KEY,
+    END_KEY,
+    DELETE_KEY
 };
 
 void init();
+void open_file(char*);
+void append_row(char*, size_t);
 void safe_exit(const char*);
 void disable_raw_mode();
 void enable_raw_mode();
@@ -48,9 +68,13 @@ void process_key_press();
 void append_to_append_buffer(struct appendBuffer*, const char*, int);
 void free_append_buffer(struct appendBuffer*);
 
-int main() {
+int main(int argc /* Argument count */, char ** argv /* Argument values */) {
     enable_raw_mode(); // Before doing anything else, we must put terminal in correct mode
     init();
+
+    if (argc >= 2) {
+        open_file(argv[1]);
+    }
 
     while (1) {
         refresh_screen();
@@ -66,6 +90,8 @@ int main() {
 void init() {
     eConfig.cursorX = 0; // Horizontal
     eConfig.cursorY = 0; // Vertical
+    eConfig.numRows = 0;
+    eConfig.row = NULL;
 
     if (get_window_size(&eConfig.windowRows, &eConfig.windowCols) == -1) {
         safe_exit("get_window_size");
@@ -73,9 +99,53 @@ void init() {
 } 
 
 /**
+ * Opens desired file
+ */ 
+void open_file(char *fileName) {
+    // Opens file and checks for success
+    FILE *fp =fopen(fileName, "r");
+    if (!fp) {
+        safe_exit("fopen");
+    }
+
+    // Gets te 
+    char *line = NULL;
+    size_t lineCap = 0;
+    ssize_t lineLen; // ssize_t differs from size_t by being signed. As a result, it can take on a negative if an error occurs.
+
+    // NOTE: getline() is useful for reading lines from a file when we don’t know how much memory to allocate for each line.
+    while ((lineLen = getline(&line, &lineCap, fp)) != -1) {
+        // Trims file
+        while (lineLen > 0 && (line[lineLen - 1] == '\n' || line[lineLen - 1] == '\r')) {
+            lineLen--;
+        }
+
+        // Adds row to editorConfiguration object
+        append_row(line, lineLen);
+    }
+
+    free(line);
+    fclose(fp);
+}
+
+/**
+ * Adds row to the array of rows in the editorConfiguration object.
+ */
+void append_row(char *rowValue, size_t length) {
+    eConfig.row = realloc(eConfig.row, sizeof(editorRow) * (eConfig.numRows + 1));
+    int index = eConfig.numRows;
+
+    eConfig.row[index].size = length;
+    eConfig.row[index].characters = malloc(length + 1);
+    memcpy(eConfig.row[index].characters, rowValue, length);
+    eConfig.row[index].characters[length] = '\0';
+    eConfig.numRows++;
+}
+
+/**
  * If an error occurs, this function is called and prints the error and then exits
  */ 
-void safe_exit(const char * error) {
+void safe_exit(const char *error) {
     // Clears screen
     write(STDOUT_FILENO, "\x1b[2J", 4);
     write(STDOUT_FILENO, "\x1b[H", 3);
@@ -148,7 +218,7 @@ int get_window_size(int *rows, int *cols) {
 }
 
 /**
- * 
+ * Calculates cursor position manually
  */
 int get_cursor_position(int *rows, int *cols) {
     char buf[32];
@@ -214,30 +284,38 @@ void refresh_screen() {
  */
 void draw_rows(struct appendBuffer *obj) {
     for (int y = 0; y < eConfig.windowRows; y++) {
-        // Displays welcome message halfway down the screen
-        if (y == eConfig.windowRows/2) {
-            char message[80];
-            int messageLength = snprintf(message, sizeof(message), "Texto -- version %s", PROGRAM_VERSION);
+        // Displays message halfway down the screen after file is displayed
+        if (y >= eConfig.numRows) { 
+            if (eConfig.numRows == 0 && y == eConfig.windowRows/2) {
+                char message[80];
+                int messageLength = snprintf(message, sizeof(message), "Texto -- version %s", PROGRAM_VERSION);
 
-            if (messageLength > eConfig.windowCols) {
-                messageLength = eConfig.windowCols;
-            }
+                if (messageLength > eConfig.windowCols) {
+                    messageLength = eConfig.windowCols;
+                }
 
-            // Centers message
-            int padding = (eConfig.windowCols - messageLength) / 2; // Gets amount of space characters required to center message
-            if (padding) {
+                // Centers message
+                int padding = (eConfig.windowCols - messageLength) / 2; // Gets amount of space characters required to center message
+                if (padding) {
+                    append_to_append_buffer(obj, "~", 1);
+                    padding--;
+                }
+
+                // Continues centering message
+                while (padding--) {
+                    append_to_append_buffer(obj, " ", 1);
+                }
+
+                append_to_append_buffer(obj, message, messageLength);
+            } else {
                 append_to_append_buffer(obj, "~", 1);
-                padding--;
             }
-
-            // Continues centering message
-            while (padding--) {
-                append_to_append_buffer(obj, " ", 1);
+        } else { // Displays file contents
+            int length = eConfig.row[y].size;
+            if (length > eConfig.windowCols) {
+                length = eConfig.windowCols;
             }
-
-            append_to_append_buffer(obj, message, messageLength);
-        } else {
-            append_to_append_buffer(obj, "~", 1);
+            append_to_append_buffer(obj, eConfig.row[y].characters, length);
         }
 
         // \x1b is the escape character (27 in decimal). [0K are the remaining three bytes. We are using the K command (Erase in Line). The 0 says clear to the right of the cursor. 
@@ -273,17 +351,54 @@ int read_key() {
             return '\x1b';
         }
         
-        // If an arrow key was pressed
+        
         if (seq[0] == '[') {
-            switch (seq[1]) {
-                case 'A': 
-                    return ARROW_UP;
-                case 'B': 
-                    return ARROW_DOWN;
-                case 'C':  
-                    return ARROW_LEFT;
-                case 'D': 
-                    return ARROW_RIGHT;
+            if (seq[1] >= '0' && seq[1] <= '9') {
+                // Reads one more byte
+                if (read(STDIN_FILENO, &seq[2], 1) != 1) {
+                    return '\x1b';
+                }
+
+                if (seq[2] == '~') {
+                    switch (seq[1]) {
+                        case '1':
+                            return HOME_KEY;
+                        case '3':
+                            return DELETE_KEY;
+                        case '4':
+                            return END_KEY;
+                        case '5':
+                            return PAGE_UP;
+                        case '6':
+                            return PAGE_DOWN;
+                        case '7':
+                            return HOME_KEY;
+                        case '8':
+                            return END_KEY;
+                    }
+                } 
+            } else if (seq[0] == 'O') {
+                switch (seq[1]) {
+                    case 'H':
+                        return HOME_KEY;
+                    case 'F':
+                        return END_KEY;
+                }
+            } else { // If an arrow key was pressed
+                switch (seq[1]) {
+                    case 'A': 
+                        return ARROW_UP;
+                    case 'B': 
+                        return ARROW_DOWN;
+                    case 'C':  
+                        return ARROW_LEFT;
+                    case 'D': 
+                        return ARROW_RIGHT;
+                    case 'H':
+                        return HOME_KEY;
+                    case 'F':
+                        return END_KEY;
+                }
             }
         }
 
@@ -298,17 +413,25 @@ int read_key() {
  */ 
 void move_cursor(int input) {
     switch (input) {
-        case ARROW_LEFT:
-            eConfig.cursorX--;
-            break;
         case ARROW_RIGHT:
-            eConfig.cursorX++;
+            if (eConfig.cursorX != 0) {
+                eConfig.cursorX--;
+            }
+            break;
+        case ARROW_LEFT:
+            if (eConfig.cursorX != eConfig.windowCols - 1) {
+                eConfig.cursorX++;
+            }
             break;
         case ARROW_UP:
-            eConfig.cursorY--;
+            if (eConfig.cursorY != 0) {
+                eConfig.cursorY--;
+            }
             break;
         case ARROW_DOWN:
-            eConfig.cursorY++;
+            if (eConfig.cursorY != eConfig.windowRows - 1) {
+                eConfig.cursorY++;
+            }
             break;    
     }
 }
@@ -327,11 +450,32 @@ void process_key_press() {
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
             break;
+
+        // Move a single space
         case ARROW_UP:
         case ARROW_DOWN:
         case ARROW_LEFT:
         case ARROW_RIGHT:
             move_cursor(input);
+            break;
+
+        // Move to top or bottom of window
+        case PAGE_UP:   
+        case PAGE_DOWN:
+            { // Create code block so we can declare variables
+                int times = eConfig.windowRows;
+                while (times--) {
+                    move_cursor(input == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+                }
+            }
+            break;
+
+        // Move cursor to ends of line
+        case HOME_KEY:
+            eConfig.cursorX = 0;
+            break;
+        case END_KEY:
+            eConfig.cursorY = eConfig.windowCols - 1;
             break;
     }
 }
@@ -363,5 +507,5 @@ void free_append_buffer(struct appendBuffer *obj) {
     free(obj->buf);
 }
 
-
+ 
 
