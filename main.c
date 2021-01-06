@@ -72,6 +72,7 @@ enum customKeyValues {
 // Functions declared here in the exact order with which they are defined
 void init();
 void open_file(char*);
+char *prompt(char*);
 void insert_row(int, char*, size_t);
 void update_row(editorRow*);
 void free_row(editorRow*);
@@ -175,6 +176,48 @@ void open_file(char *fileName) {
 
     free(line);
     fclose(fp);
+}
+
+/**
+ * 
+ */
+char *prompt(char *promp) {
+    size_t bufferSize = 128;
+    char *buf = malloc(bufferSize);
+
+    size_t bufferLength = 0;
+    buf[0] = '\0';
+
+    // Gets user input
+    while(1) {
+        set_status_message(promp, buf);
+        refresh_screen();
+
+        int input = read_key();
+
+
+        if (input == DELETE_KEY || input == CTRL_KEY('h') || input == BACKSPACE) { 
+            if (bufferLength != 0) {
+                buf[--bufferLength] = '\0';
+            }
+        } else if (input == '\x1b') { // Cancel process
+            set_status_message("");
+            free(buf);
+            return NULL;
+        } else if (input == '\r'){ // Enter key is pressed, returns buf
+            if (bufferLength != 0) {
+                set_status_message("");
+                return buf;
+            }
+        } else if (!iscntrl(input) && input < 128) { // If user enters key
+            if (bufferLength == bufferSize - 1) {
+                bufferSize *= 2;
+                buf = realloc(buf, bufferSize);
+            }
+            buf[bufferLength++] = input;
+            buf[bufferLength] = '\0';
+        }
+    }
 }
 
 /**
@@ -925,7 +968,11 @@ char *rows_to_string(int *bufferLength) {
  */  
 void save() {
     if (eConfig.fileName == NULL) {
-        return;
+        eConfig.fileName = prompt("Save as: %s (ESC to cancel)");
+        if (eConfig.fileName == NULL) {
+            set_status_message("Save canceled");
+            return;
+        }
     }
 
     int length;

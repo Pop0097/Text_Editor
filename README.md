@@ -4,9 +4,13 @@ Text editor made using C. Very useful project that helped me understand how term
 
 ## Launching the Text Editor
 
+Compiling Code:
 1. Clone the repository and enter the directory in command line/Terminal.
 2. Enter `make` to compile the code.
-3. Enter `./texto <file_path>` to run the code.
+
+Using the text editor:
+- Edit an already existing file: Enter `./texto <filepath>`
+- Create a new file: Enter `./texto`. You will be prompted when saving to name the file.
 
 ## Helpful Resources
 
