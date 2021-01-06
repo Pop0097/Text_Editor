@@ -9,8 +9,8 @@ Compiling Code:
 2. Enter `make` to compile the code.
 
 Using the text editor:
-- Edit an already existing file: Enter `./texto <filepath>`
-- Create a new file: Enter `./texto`. You will be prompted when saving to name the file.
+- **Edit an already existing file:** Enter `./texto <filepath>`
+- **Create a new file:** Enter `./texto`. You will be prompted when saving to name the file.
 
 ## Helpful Resources
 
