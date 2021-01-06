@@ -12,22 +12,34 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <string.h>
+#include <time.h>
+#include <stdarg.h>
 
 // Gets ASCII value of Ctrl-k by setting bits 5-7 as 0
 #define CTRL_KEY(letter) ((letter) & 0x1f) 
 // Default constructor for appendBuffer structure
 #define APPENDBUFFER_INIT {NULL, 0}
 #define PROGRAM_VERSION "0.0.1B"
+#define TAB_STOP 8
 
 // Stores a row of text
 typedef struct editorRow {
+    int rsize;
+    char *render; // This contains the text that will be displayed
     int size;
     char *characters;
 } editorRow;  
 
 // Stores the configuration of the terminal and editor
 struct editorConfiguration {
-    int cursorX, cursorY, windowRows, windowCols, numRows;
+    int characterX, characterY;
+    int renderX;
+    int windowRows, windowCols;
+    int numRows;
+    int rowOffset, colOffset;
+    char *fileName;
+    char *statusMessage[80];
+    time_t statusMessageTime;
     editorRow *row;
     struct termios original_termios; 
 };
@@ -55,13 +67,19 @@ enum customKeyValues {
 void init();
 void open_file(char*);
 void append_row(char*, size_t);
+void update_row(editorRow*);
 void safe_exit(const char*);
 void disable_raw_mode();
 void enable_raw_mode();
 int get_window_size(int*, int*);
 int get_cursor_position(int*, int*);
 void refresh_screen();
+void set_status_message(const char*, ...);
 void draw_rows(struct appendBuffer*);
+void draw_status_bar(struct appendBuffer*);
+void draw_message_bar(struct appendBuffer*);
+int row_character_index_to_render_index(editorRow*, int);
+void scroll();
 int read_key();
 void move_cursor(int);
 void process_key_press();
@@ -76,6 +94,8 @@ int main(int argc /* Argument count */, char ** argv /* Argument values */) {
         open_file(argv[1]);
     }
 
+    set_status_message("HELP: Press Ctrl-Q to quit");
+
     while (1) {
         refresh_screen();
         process_key_press();
@@ -88,14 +108,22 @@ int main(int argc /* Argument count */, char ** argv /* Argument values */) {
  * Initializes the editorConfiguration object
  */
 void init() {
-    eConfig.cursorX = 0; // Horizontal
-    eConfig.cursorY = 0; // Vertical
+    eConfig.characterX = 0; // Horizontal (with respect to characters array)
+    eConfig.characterY = 0; // Vertical (with respect to characters array)
+    eConfig.renderX = 0; // Position of cursor within render array of row
     eConfig.numRows = 0;
     eConfig.row = NULL;
+    eConfig.fileName = NULL;
+    eConfig.rowOffset = 0;
+    eConfig.colOffset = 0;
+    eConfig.statusMessage[0] = '\0';
+    eConfig.statusMessageTime = 0;
 
     if (get_window_size(&eConfig.windowRows, &eConfig.windowCols) == -1) {
         safe_exit("get_window_size");
     }
+
+    eConfig.windowRows -= 2;
 } 
 
 /**
@@ -107,6 +135,8 @@ void open_file(char *fileName) {
     if (!fp) {
         safe_exit("fopen");
     }
+    free(eConfig.fileName);
+    eConfig.fileName = strdup(fileName); // strdup() copies given string and allocates memory (assumes that we will free it later)
 
     // Gets te 
     char *line = NULL;
@@ -140,6 +170,42 @@ void append_row(char *rowValue, size_t length) {
     memcpy(eConfig.row[index].characters, rowValue, length);
     eConfig.row[index].characters[length] = '\0';
     eConfig.numRows++;
+
+    eConfig.row[index].rsize = 0;
+    eConfig.row[index].render = NULL;
+    update_row(&eConfig.row[index]);
+}
+
+/**
+ * 
+ */ 
+void update_row(editorRow *row) {
+    // Counts the number of tabs in the line
+    int tabCount = 0;
+    for (int i = 0; i < row->size; i++) {
+        if (row->characters[i] == '\t') {
+            tabCount++;
+        }
+    }
+
+    free(row->render);
+    row->render = malloc(row->size + (tabCount * (TAB_STOP - 1)) + 1); // Max size of each tab is 8 bytes. row->size accounts for one of the bytes, so we multiply tabCount by 7.
+
+    // Updates the render 
+    int index = 0;
+    for (int i = 0; i < row->size; i++) {
+        if (row->characters[i] == '\t') { // If there is a tab, render it as multiple spaces
+            row->render[index++] = ' ';
+            while (index % TAB_STOP != 0) { // Tabs only go up to the next column whose number is divisible by 8
+                row->render[index++] = ' ';
+            }
+        } else {
+            row->render[index++] = row->characters[i];
+        }
+    }
+
+    row->render[index] = '\0';
+    row->rsize = index;
 }
 
 /**
@@ -256,6 +322,8 @@ int get_cursor_position(int *rows, int *cols) {
  * This function writes an escape sequence into the terminal, which instruct the terminal to do text formatting tasks
  */ 
 void refresh_screen() {
+    scroll();
+
     struct appendBuffer obj = APPENDBUFFER_INIT;
 
     // Hides cursor while screen refreshes (l means Reset Mode)
@@ -265,10 +333,12 @@ void refresh_screen() {
     append_to_append_buffer(&obj, "\x1b[H", 3);
 
     draw_rows(&obj);
+    draw_status_bar(&obj);
+    draw_message_bar(&obj);
 
     // Moves cursor to the current position
     char buff[32];
-    snprintf(buff, sizeof(buff), "\x1b[%d;%dH", eConfig.cursorY + 1, eConfig.cursorX + 1);
+    snprintf(buff, sizeof(buff), "\x1b[%d;%dH", (eConfig.characterY - eConfig.rowOffset) + 1, (eConfig.renderX - eConfig.colOffset) + 1);
     append_to_append_buffer(&obj, buff, strlen(buff));
 
     // Makes cursor visible (h means Set Mode)
@@ -280,12 +350,28 @@ void refresh_screen() {
 }
 
 /**
+ * 
+ * Function uses an elipsis parameter (makes this function a VARIADIC FUNCTION), meaning that we can have a variable amount of parameters (minimum 1 tho)
+ */
+void set_status_message(const char *message, ...) { 
+    va_list ap;
+    va_start(ap, message);
+
+    vsnprintf(eConfig.statusMessage, sizeof(eConfig.statusMessage), message, ap);
+
+    va_end(ap);
+    eConfig.statusMessageTime = time(NULL);
+}
+
+/**
  * Draws tildes at the left hand side of each of the rows  
  */
 void draw_rows(struct appendBuffer *obj) {
     for (int y = 0; y < eConfig.windowRows; y++) {
+        int fileRow = y + eConfig.rowOffset; // Add offset so we get the lines we wish to see
+
         // Displays message halfway down the screen after file is displayed
-        if (y >= eConfig.numRows) { 
+        if (fileRow >= eConfig.numRows) { 
             if (eConfig.numRows == 0 && y == eConfig.windowRows/2) {
                 char message[80];
                 int messageLength = snprintf(message, sizeof(message), "Texto -- version %s", PROGRAM_VERSION);
@@ -311,19 +397,113 @@ void draw_rows(struct appendBuffer *obj) {
                 append_to_append_buffer(obj, "~", 1);
             }
         } else { // Displays file contents
-            int length = eConfig.row[y].size;
+            int length = eConfig.row[fileRow].rsize - eConfig.colOffset;
+            if (length < 0) {
+                length = 0;
+            }
+
             if (length > eConfig.windowCols) {
                 length = eConfig.windowCols;
             }
-            append_to_append_buffer(obj, eConfig.row[y].characters, length);
+            append_to_append_buffer(obj, &eConfig.row[fileRow].render[eConfig.colOffset], length);
         }
 
         // \x1b is the escape character (27 in decimal). [0K are the remaining three bytes. We are using the K command (Erase in Line). The 0 says clear to the right of the cursor. 
         append_to_append_buffer(obj, "\x1b[0K", 4);
+        append_to_append_buffer(obj, "\r\n", 2);
+    }
+}
 
-        if (y < eConfig.windowRows - 1) { // if statement ensures last line has a tilde
-            append_to_append_buffer(obj, "\r\n", 2);
+/**
+ * 
+ */
+void draw_status_bar(struct appendBuffer *obj) {
+    append_to_append_buffer(obj, "\x1b[7m", 4); // inverts colours (m command is the "Select Graphic Rendition" condition)
+
+    // Prepares string to be printed
+    char status[80], renderStatus[80];
+    int length = snprintf(status, sizeof(status), "%.20s - %d lines", eConfig.fileName ? eConfig.fileName : "[No Name]", eConfig.numRows);
+    if (length > eConfig.windowCols) {
+        length = eConfig.windowCols;
+    }
+
+    int renderLength = snprintf(renderStatus, sizeof(renderStatus), "%d:%d", eConfig.characterY + 1, eConfig.numRows);
+
+    // Adds string
+    append_to_append_buffer(obj, status, length);
+
+    while (length < eConfig.windowCols) { // Fills in rest of row with white spaces until the point where renderStatus barely fits
+        if (eConfig.windowCols - length == renderLength) { 
+            append_to_append_buffer(obj, renderStatus, renderLength);
+            break;
+        } else {
+            append_to_append_buffer(obj, " ", 1);
+            length++;
         }
+    }
+
+    append_to_append_buffer(obj, "\x1b[0m", 4); // Switches back to normal formatting
+    append_to_append_buffer(obj, "\r\n", 2);
+} 
+
+/**
+ * 
+ */
+void draw_message_bar(struct appendBuffer *obj) {
+    append_to_append_buffer(obj, "\x1b[K", 3); // Clears message bar
+    
+    int messageLength = strlen(eConfig.statusMessage);
+
+    if (messageLength > eConfig.windowCols) {
+        messageLength = eConfig.windowCols;
+    }
+
+    // After five seconds the message disappears
+    if (messageLength && time(NULL) - eConfig.statusMessageTime < 5) { 
+        append_to_append_buffer(obj, eConfig.statusMessage, messageLength);
+    }
+}
+
+/**
+ * Converts the cursor index in terms of the characters array to an index in terms of the render array
+ */
+int row_character_index_to_render_index(editorRow *row, int characterX) {
+    int renderX = 0;
+    
+    for (int i = 0; i < characterX; i++) {
+        if (row->characters[i] == '\t') { 
+            // (renderX % TAB_STOP) gives us the number of columns between the renderX and the previous tab stop
+            // (TAB_STOP - 1) is the maximum we are away from the next tab stop
+            // The math is straightforward after this
+            renderX += (TAB_STOP - 1) - (renderX % TAB_STOP);
+        }
+        renderX++; // Gets us to the right of the next tab stop if a tab did exist
+    }
+
+    return renderX;
+}
+
+/**
+ * Scrolls screen if cursor exits the window from top or bottom
+ */ 
+void scroll() {
+    eConfig.renderX = 0;
+
+    if (eConfig.characterY < eConfig.numRows) { // Above visuble window
+        eConfig.renderX = row_character_index_to_render_index(&eConfig.row[eConfig.characterY], eConfig.characterX);
+    }
+
+    if (eConfig.characterY >= eConfig.rowOffset + eConfig.windowRows) { // Below visible window
+        eConfig.rowOffset = eConfig.characterY - eConfig.windowRows + 1;
+    }
+
+    // To left of screen
+    if (eConfig.renderX < eConfig.colOffset) {
+        eConfig.colOffset = eConfig.renderX;
+    }
+
+    if (eConfig.renderX >= eConfig.colOffset + eConfig.windowCols) {
+        eConfig.colOffset = eConfig.renderX - eConfig.windowCols + 1;
     }
 }
 
@@ -391,9 +571,9 @@ int read_key() {
                     case 'B': 
                         return ARROW_DOWN;
                     case 'C':  
-                        return ARROW_LEFT;
-                    case 'D': 
                         return ARROW_RIGHT;
+                    case 'D': 
+                        return ARROW_LEFT;
                     case 'H':
                         return HOME_KEY;
                     case 'F':
@@ -412,27 +592,42 @@ int read_key() {
  * Handles key inputs meant for moving the cursor
  */ 
 void move_cursor(int input) {
+    editorRow *row = (eConfig.characterY >= eConfig.numRows) ? NULL : &eConfig.row[eConfig.characterY];
+
     switch (input) {
-        case ARROW_RIGHT:
-            if (eConfig.cursorX != 0) {
-                eConfig.cursorX--;
+        case ARROW_LEFT:
+            if (eConfig.characterX != 0) {
+                eConfig.characterX--;
+            } else if (eConfig.characterY > 0) { 
+                eConfig.characterY--;
+                eConfig.characterX = eConfig.row[eConfig.characterY].size;
             }
             break;
-        case ARROW_LEFT:
-            if (eConfig.cursorX != eConfig.windowCols - 1) {
-                eConfig.cursorX++;
+        case ARROW_RIGHT:
+            if (row && eConfig.characterX < row->size) {
+                eConfig.characterX++;
+            } else if (row && eConfig.characterX == row->size) {
+                eConfig.characterY++;
+                eConfig.characterX = 0;
             }
             break;
         case ARROW_UP:
-            if (eConfig.cursorY != 0) {
-                eConfig.cursorY--;
+            if (eConfig.characterY != 0) {
+                eConfig.characterY--;
             }
             break;
         case ARROW_DOWN:
-            if (eConfig.cursorY != eConfig.windowRows - 1) {
-                eConfig.cursorY++;
+            if (eConfig.characterY < eConfig.numRows) {
+                eConfig.characterY++;
             }
             break;    
+    }
+
+    // If cursor goes past end of line, then this moves it back to the end of the line
+    row = (eConfig.characterY >= eConfig.numRows) ? NULL : &eConfig.row[eConfig.characterY];
+    int rowLen = row ? row->size : 0;
+    if (eConfig.characterX > rowLen) {
+        eConfig.characterX = rowLen;
     }
 }
 
@@ -463,6 +658,15 @@ void process_key_press() {
         case PAGE_UP:   
         case PAGE_DOWN:
             { // Create code block so we can declare variables
+                if (input == PAGE_UP) { // Moves cursor to top of window
+                    eConfig.characterY = eConfig.rowOffset;
+                } else if (input == PAGE_DOWN) { // Moves cursor to bottom of window
+                    eConfig.characterY = eConfig.rowOffset + eConfig.windowRows - 1;
+                    if (eConfig.characterY > eConfig.numRows) { // Ensures that the index is not larger than the max number
+                        eConfig.characterY = eConfig.numRows;
+                    }
+                }
+
                 int times = eConfig.windowRows;
                 while (times--) {
                     move_cursor(input == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -471,11 +675,13 @@ void process_key_press() {
             break;
 
         // Move cursor to ends of line
-        case HOME_KEY:
-            eConfig.cursorX = 0;
+        case HOME_KEY: // Begining
+            eConfig.characterX = 0;
             break;
-        case END_KEY:
-            eConfig.cursorY = eConfig.windowCols - 1;
+        case END_KEY: // End
+            if (eConfig.characterY < eConfig.numRows) {
+                eConfig.characterX = eConfig.row[eConfig.characterY].size;
+            }
             break;
     }
 }
