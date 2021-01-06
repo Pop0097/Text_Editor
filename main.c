@@ -14,12 +14,13 @@
 #include <string.h>
 #include <time.h>
 #include <stdarg.h>
+#include <fcntl.h>
 
 // Gets ASCII value of Ctrl-k by setting bits 5-7 as 0
 #define CTRL_KEY(letter) ((letter) & 0x1f) 
-// Default constructor for appendBuffer structure
-#define APPENDBUFFER_INIT {NULL, 0}
-#define PROGRAM_VERSION "0.0.1B"
+
+#define APPENDBUFFER_INIT {NULL, 0} // Default constructor for appendBuffer structure
+#define PROGRAM_VERSION "0.0.1"
 #define TAB_STOP 8
 
 // Stores a row of text
@@ -39,6 +40,7 @@ struct editorConfiguration {
     int rowOffset, colOffset;
     char *fileName;
     char *statusMessage[80];
+    int unsavedChanges;
     time_t statusMessageTime;
     editorRow *row;
     struct termios original_termios; 
@@ -53,6 +55,7 @@ struct appendBuffer {
 struct editorConfiguration eConfig;
 
 enum customKeyValues {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -64,10 +67,12 @@ enum customKeyValues {
     DELETE_KEY
 };
 
+// Functions declared here in the exact order with which they are defined
 void init();
 void open_file(char*);
 void append_row(char*, size_t);
 void update_row(editorRow*);
+void insert_character_in_row(editorRow*, int, int);
 void safe_exit(const char*);
 void disable_raw_mode();
 void enable_raw_mode();
@@ -82,9 +87,12 @@ int row_character_index_to_render_index(editorRow*, int);
 void scroll();
 int read_key();
 void move_cursor(int);
+void insert_character(int);
 void process_key_press();
 void append_to_append_buffer(struct appendBuffer*, const char*, int);
 void free_append_buffer(struct appendBuffer*);
+char *rows_to_string(int*);
+void save();
 
 int main(int argc /* Argument count */, char ** argv /* Argument values */) {
     enable_raw_mode(); // Before doing anything else, we must put terminal in correct mode
@@ -94,7 +102,7 @@ int main(int argc /* Argument count */, char ** argv /* Argument values */) {
         open_file(argv[1]);
     }
 
-    set_status_message("HELP: Press Ctrl-Q to quit");
+    set_status_message("HELP: Ctrl-Q = quit | Ctrl-S = save");
 
     while (1) {
         refresh_screen();
@@ -118,6 +126,7 @@ void init() {
     eConfig.colOffset = 0;
     eConfig.statusMessage[0] = '\0';
     eConfig.statusMessageTime = 0;
+    eConfig.unsavedChanges = 0;
 
     if (get_window_size(&eConfig.windowRows, &eConfig.windowCols) == -1) {
         safe_exit("get_window_size");
@@ -154,6 +163,8 @@ void open_file(char *fileName) {
         append_row(line, lineLen);
     }
 
+    eConfig.unsavedChanges = 0;
+
     free(line);
     fclose(fp);
 }
@@ -170,10 +181,11 @@ void append_row(char *rowValue, size_t length) {
     memcpy(eConfig.row[index].characters, rowValue, length);
     eConfig.row[index].characters[length] = '\0';
     eConfig.numRows++;
+    eConfig.unsavedChanges++;
 
     eConfig.row[index].rsize = 0;
     eConfig.row[index].render = NULL;
-    update_row(&eConfig.row[index]);
+    update_row(&eConfig.row[index]);   
 }
 
 /**
@@ -206,6 +218,23 @@ void update_row(editorRow *row) {
 
     row->render[index] = '\0';
     row->rsize = index;
+}
+
+/**
+ * 
+ */
+void insert_character_in_row(editorRow *row, int index, int character) {
+    if (index < 0 || index > row->size) {
+        index = row->size;
+    }
+
+    row->characters = realloc(row->characters, row->size + 2); // Add two to make room for null byte
+    memmove(&row->characters[index + 1], &row->characters[index], row->size - index + 1); // Memmove like memcpy, but is safer to use when memory overlaps
+    row->size++;
+    row->characters[index] = character;
+    update_row(row);
+
+    eConfig.unsavedChanges++;
 }
 
 /**
@@ -422,7 +451,7 @@ void draw_status_bar(struct appendBuffer *obj) {
 
     // Prepares string to be printed
     char status[80], renderStatus[80];
-    int length = snprintf(status, sizeof(status), "%.20s - %d lines", eConfig.fileName ? eConfig.fileName : "[No Name]", eConfig.numRows);
+    int length = snprintf(status, sizeof(status), "%.20s - %d lines %s", eConfig.fileName ? eConfig.fileName : "[No Name]", eConfig.numRows, eConfig.unsavedChanges != 0 ? "(modified)" : "");
     if (length > eConfig.windowCols) {
         length = eConfig.windowCols;
     }
@@ -632,6 +661,17 @@ void move_cursor(int input) {
 }
 
 /**
+ * 
+ */
+void insert_character(int character) {
+    if (eConfig.characterY == eConfig.numRows) { // If we are at the end of the file, we need to add a new row.
+        append_row("", 0);
+    }
+    insert_character_in_row(&eConfig.row[eConfig.characterY], eConfig.characterX, character);
+    eConfig.characterX++;
+}
+
+/**
  * Waits for a key press and then handles it. 
  */ 
 void process_key_press() {
@@ -639,11 +679,25 @@ void process_key_press() {
 
     // Checks if input matches any reserved commands
     switch (input) {
+        case '\r': // Enter key
+
+            break;
+
         case CTRL_KEY('q'):
             // Clears screen
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
+            break;
+
+        case CTRL_KEY('s'):
+            save();
+            break;
+        
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DELETE_KEY:
+        
             break;
 
         // Move a single space
@@ -683,6 +737,14 @@ void process_key_press() {
                 eConfig.characterX = eConfig.row[eConfig.characterY].size;
             }
             break;
+
+        case CTRL_KEY('l'):
+        case '\x1b':
+            break;
+        
+        default:
+            insert_character(input);
+            break;
     }
 }
 
@@ -713,5 +775,63 @@ void free_append_buffer(struct appendBuffer *obj) {
     free(obj->buf);
 }
 
- 
+/**
+ * 
+ */
+char *rows_to_string(int *bufferLength) {
+    int totalLength = 0;
+    
+    // Add up lengths of each row (we add one for the newline character)
+    for (int i = 0; i < eConfig.numRows; i++) {
+        totalLength += eConfig.row[i].size + 1;
+    }
+    *bufferLength = totalLength;
+
+    // Create a buffer with correct length
+    char *buf = malloc(totalLength);
+    char *p = buf;
+
+    // In each iteration, we copy contents of the row and add a newline character
+    for (int i = 0; i < eConfig.numRows; i++)  {
+        memcpy(p, eConfig.row[i].characters, eConfig.row[i].size);
+        p += eConfig.row[i].size;
+        *p = '\n';
+        p++; // next memory address
+    }
+
+    return buf;
+} 
+
+/**
+ *
+ */  
+void save() {
+    if (eConfig.fileName == NULL) {
+        return;
+    }
+
+    int length;
+    char *buf = rows_to_string(&length);
+
+    // O_CREATE -> create file if it does not exist
+    // O_RDWR -> open file for reading and writing
+    // 0644 -> standard permissions (reading and writing)
+    int fd = open(eConfig.fileName, O_RDWR | O_CREAT, 0644);
+
+    if (fd != -1) {
+        if (ftruncate(fd, length) /* Sets file size to specified length */ != -1) {
+            if (write(fd, buf, length) == length) {
+                close(fd);
+                free(buf);
+                set_status_message("%d bytes written to disk", length);
+                eConfig.unsavedChanges = 0;
+                return;
+            }
+        }
+        close(fd);
+    }
+
+    free(buf);
+    set_status_message("Can't save to disk! I/O error: %s", strerror(errno));
+}
 
