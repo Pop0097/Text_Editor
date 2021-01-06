@@ -23,6 +23,8 @@
 #define PROGRAM_VERSION "0.0.1"
 #define TAB_STOP 8
 
+#define QUIT_TIMES 2
+
 // Stores a row of text
 typedef struct editorRow {
     int rsize;
@@ -70,9 +72,13 @@ enum customKeyValues {
 // Functions declared here in the exact order with which they are defined
 void init();
 void open_file(char*);
-void append_row(char*, size_t);
+void insert_row(int, char*, size_t);
 void update_row(editorRow*);
+void free_row(editorRow*);
+void delete_row(int);
 void insert_character_in_row(editorRow*, int, int);
+void append_string_in_row(editorRow*, char*, size_t);
+void delete_character_in_row(editorRow*, int);
 void safe_exit(const char*);
 void disable_raw_mode();
 void enable_raw_mode();
@@ -88,6 +94,8 @@ void scroll();
 int read_key();
 void move_cursor(int);
 void insert_character(int);
+void insert_new_line();
+void delete_character();
 void process_key_press();
 void append_to_append_buffer(struct appendBuffer*, const char*, int);
 void free_append_buffer(struct appendBuffer*);
@@ -126,7 +134,7 @@ void init() {
     eConfig.colOffset = 0;
     eConfig.statusMessage[0] = '\0';
     eConfig.statusMessageTime = 0;
-    eConfig.unsavedChanges = 0;
+    eConfig.unsavedChanges = 0; // Tells editor if file is modified
 
     if (get_window_size(&eConfig.windowRows, &eConfig.windowCols) == -1) {
         safe_exit("get_window_size");
@@ -160,7 +168,7 @@ void open_file(char *fileName) {
         }
 
         // Adds row to editorConfiguration object
-        append_row(line, lineLen);
+        insert_row(eConfig.numRows, line, lineLen);
     }
 
     eConfig.unsavedChanges = 0;
@@ -172,9 +180,13 @@ void open_file(char *fileName) {
 /**
  * Adds row to the array of rows in the editorConfiguration object.
  */
-void append_row(char *rowValue, size_t length) {
+void insert_row(int index, char *rowValue, size_t length) {
+    if (index < 0 || index > eConfig.numRows) {
+        return;
+    }
+
     eConfig.row = realloc(eConfig.row, sizeof(editorRow) * (eConfig.numRows + 1));
-    int index = eConfig.numRows;
+    memmove(&eConfig.row[index + 1], &eConfig.row[index], sizeof(editorRow) * (eConfig.numRows - index));
 
     eConfig.row[index].size = length;
     eConfig.row[index].characters = malloc(length + 1);
@@ -223,6 +235,28 @@ void update_row(editorRow *row) {
 /**
  * 
  */
+void free_row(editorRow *row) {
+    free(row->render);
+    free(row->characters);
+}
+
+/**
+ * 
+ */
+void delete_row(int index) {
+    if (index < 0 || index > eConfig.numRows) {
+        return;
+    }
+
+    free_row(&eConfig.row[index]); // Clears buffers in row
+    memmove(&eConfig.row[index], &eConfig.row[index + 1], sizeof(editorRow) * (eConfig.numRows - index - 1)); // Move memory of previous row to the recently deleted.
+    eConfig.numRows--;
+    eConfig.unsavedChanges++;
+}
+
+/**
+ * 
+ */
 void insert_character_in_row(editorRow *row, int index, int character) {
     if (index < 0 || index > row->size) {
         index = row->size;
@@ -236,6 +270,36 @@ void insert_character_in_row(editorRow *row, int index, int character) {
 
     eConfig.unsavedChanges++;
 }
+
+/**
+ * 
+ */
+void append_string_in_row(editorRow *row, char *str, size_t length) {
+    row->characters = realloc(row->characters, row->size + length + 1);
+
+    memcpy(&row->characters[row->size], str, length);
+    
+    row->size += length;
+    row->characters[row->size] = '\0';
+    
+    update_row(row);
+    
+    eConfig.unsavedChanges++;
+} 
+
+/**
+ * 
+ */
+void delete_character_in_row(editorRow *row, int index) {
+    if (index < 0 || index >= row->size) {
+        return;
+    }
+
+    memmove(&row->characters[index] /* Destination */, &row->characters[index + 1] /* Starting address */, row->size - index /* Indices */);
+    row->size--;
+    update_row(row);
+    eConfig.unsavedChanges++;
+} 
 
 /**
  * If an error occurs, this function is called and prints the error and then exits
@@ -665,25 +729,74 @@ void move_cursor(int input) {
  */
 void insert_character(int character) {
     if (eConfig.characterY == eConfig.numRows) { // If we are at the end of the file, we need to add a new row.
-        append_row("", 0);
+        insert_row(eConfig.numRows, "", 0);
     }
     insert_character_in_row(&eConfig.row[eConfig.characterY], eConfig.characterX, character);
     eConfig.characterX++;
 }
 
 /**
+ * 
+ */
+void insert_new_line() {
+    if (eConfig.characterX == 0) { // If we are at begining of line, insert blank lie before row we were on
+        insert_row(eConfig.characterY, "", 0);
+    } else { // Otherwise, split line we are on into two rows
+        editorRow *row = &eConfig.row[eConfig.characterY];
+        insert_row(eConfig.characterY + 1, &row->characters[eConfig.characterX], row->size - eConfig.characterX);
+        row = &eConfig.row[eConfig.characterY];
+        row->size = eConfig.characterX;
+        row->characters[row->size] = '\0';
+        update_row(row);
+    }
+    eConfig.characterY++;
+    eConfig.characterX = 0;
+}
+
+/**
+ * 
+ */
+void delete_character() {
+    if (eConfig.characterY == eConfig.numRows) { // Cursor past end of file, nothing to delete
+        return;
+    }
+
+    if (eConfig.characterX == 0 && eConfig.characterY == 0) {
+        return;
+    }
+
+    editorRow *row = &eConfig.row[eConfig.characterY];
+    if (eConfig.characterX > 0) {
+        delete_character_in_row(row, eConfig.characterX - 1);
+        eConfig.characterX--; // Move cursor one to left after deleting
+    } else {
+        eConfig.characterX = eConfig.row[eConfig.characterY - 1].size;
+        append_string_in_row(&eConfig.row[eConfig.characterY] - 1, row->characters, row->size);
+        delete_row(eConfig.characterY);
+        eConfig.characterY--;
+    }
+}
+
+/**
  * Waits for a key press and then handles it. 
  */ 
 void process_key_press() {
+    static int quitTimes = QUIT_TIMES; // Use static variable so value is consistent every time we call this function (in subsequent calls, variable is not re-initialized)
+
     int input = read_key(); // Gets input
 
     // Checks if input matches any reserved commands
     switch (input) {
         case '\r': // Enter key
-
+            insert_new_line();
             break;
 
         case CTRL_KEY('q'):
+            if (eConfig.unsavedChanges != 0 && quitTimes > 0) {
+                set_status_message("File has unsaved changes. Press Ctrl-Q %d more times to quit.", quitTimes);
+                quitTimes--;
+                return;
+            }
             // Clears screen
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
@@ -697,7 +810,10 @@ void process_key_press() {
         case BACKSPACE:
         case CTRL_KEY('h'):
         case DELETE_KEY:
-        
+            if (input == DELETE_KEY) {
+                move_cursor(ARROW_RIGHT);
+            }
+            delete_character();
             break;
 
         // Move a single space
@@ -746,6 +862,8 @@ void process_key_press() {
             insert_character(input);
             break;
     }
+
+    quitTimes = QUIT_TIMES; // If Ctrl-Q is not pressed, value resets
 }
 
 /**
