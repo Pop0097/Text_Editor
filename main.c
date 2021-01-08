@@ -19,7 +19,7 @@
 // Gets ASCII value of Ctrl-k by setting bits 5-7 as 0
 #define CTRL_KEY(letter) ((letter) & 0x1f) 
 
-#define APPENDBUFFER_INIT {NULL, 0} // Default constructor for appendBuffer structure
+#define APPEND_BUFFER_INIT {NULL, 0} // Default constructor for appendBuffer structure
 #define PROGRAM_VERSION "0.0.1"
 #define TAB_STOP 8
 
@@ -72,7 +72,7 @@ enum customKeyValues {
 // Functions declared here in the exact order with which they are defined
 void init();
 void open_file(char*);
-char *prompt(char*);
+char *prompt(char*, void (*func)(char*, int));
 void insert_row(int, char*, size_t);
 void update_row(editorRow*);
 void free_row(editorRow*);
@@ -91,6 +91,7 @@ void draw_rows(struct appendBuffer*);
 void draw_status_bar(struct appendBuffer*);
 void draw_message_bar(struct appendBuffer*);
 int row_character_index_to_render_index(editorRow*, int);
+int row_render_index_to_character_index(editorRow*, int);
 void scroll();
 int read_key();
 void move_cursor(int);
@@ -102,6 +103,8 @@ void append_to_append_buffer(struct appendBuffer*, const char*, int);
 void free_append_buffer(struct appendBuffer*);
 char *rows_to_string(int*);
 void save();
+void find_callback(char*, int);
+void find();
 
 int main(int argc /* Argument count */, char ** argv /* Argument values */) {
     enable_raw_mode(); // Before doing anything else, we must put terminal in correct mode
@@ -111,7 +114,7 @@ int main(int argc /* Argument count */, char ** argv /* Argument values */) {
         open_file(argv[1]);
     }
 
-    set_status_message("HELP: Ctrl-Q = quit | Ctrl-S = save");
+    set_status_message("HELP: Ctrl-Q = quit | Ctrl-F = find | Ctrl-S = save");
 
     while (1) {
         refresh_screen();
@@ -179,9 +182,9 @@ void open_file(char *fileName) {
 }
 
 /**
- * 
+ * Promps user in message bar and accepts input
  */
-char *prompt(char *promp) {
+char *prompt(char *promp, void (*func)(char*, int)) {
     size_t bufferSize = 128;
     char *buf = malloc(bufferSize);
 
@@ -195,20 +198,26 @@ char *prompt(char *promp) {
 
         int input = read_key();
 
-
         if (input == DELETE_KEY || input == CTRL_KEY('h') || input == BACKSPACE) { 
             if (bufferLength != 0) {
                 buf[--bufferLength] = '\0';
             }
         } else if (input == '\x1b') { // Cancel process
             set_status_message("");
+            if (func) {
+                func(buf, input);
+            }
             free(buf);
             return NULL;
         } else if (input == '\r'){ // Enter key is pressed, returns buf
             if (bufferLength != 0) {
                 set_status_message("");
+                if (func) {
+                    func(buf, input);
+                }
                 return buf;
             }
+            return NULL;
         } else if (!iscntrl(input) && input < 128) { // If user enters key
             if (bufferLength == bufferSize - 1) {
                 bufferSize *= 2;
@@ -216,6 +225,10 @@ char *prompt(char *promp) {
             }
             buf[bufferLength++] = input;
             buf[bufferLength] = '\0';
+        }
+
+        if (func) {
+            func(buf, input);
         }
     }
 }
@@ -244,7 +257,7 @@ void insert_row(int index, char *rowValue, size_t length) {
 }
 
 /**
- * 
+ * Updates parameters of editorRow object
  */ 
 void update_row(editorRow *row) {
     // Counts the number of tabs in the line
@@ -276,7 +289,7 @@ void update_row(editorRow *row) {
 }
 
 /**
- * 
+ * Frees all heap-allocated parameters of the editorRow object
  */
 void free_row(editorRow *row) {
     free(row->render);
@@ -284,7 +297,7 @@ void free_row(editorRow *row) {
 }
 
 /**
- * 
+ * Removes row from the array of rows in the editorConfiguration object
  */
 void delete_row(int index) {
     if (index < 0 || index > eConfig.numRows) {
@@ -298,7 +311,7 @@ void delete_row(int index) {
 }
 
 /**
- * 
+ * Used when typing a character
  */
 void insert_character_in_row(editorRow *row, int index, int character) {
     if (index < 0 || index > row->size) {
@@ -315,7 +328,7 @@ void insert_character_in_row(editorRow *row, int index, int character) {
 }
 
 /**
- * 
+ * Used when deleting a row
  */
 void append_string_in_row(editorRow *row, char *str, size_t length) {
     row->characters = realloc(row->characters, row->size + length + 1);
@@ -331,7 +344,7 @@ void append_string_in_row(editorRow *row, char *str, size_t length) {
 } 
 
 /**
- * 
+ * Used to delete a character 
  */
 void delete_character_in_row(editorRow *row, int index) {
     if (index < 0 || index >= row->size) {
@@ -460,7 +473,7 @@ int get_cursor_position(int *rows, int *cols) {
 void refresh_screen() {
     scroll();
 
-    struct appendBuffer obj = APPENDBUFFER_INIT;
+    struct appendBuffer obj = APPEND_BUFFER_INIT;
 
     // Hides cursor while screen refreshes (l means Reset Mode)
     append_to_append_buffer(&obj, "\x1b[?25l", 6);
@@ -551,7 +564,7 @@ void draw_rows(struct appendBuffer *obj) {
 }
 
 /**
- * 
+ * Displays status bar at the second last row of window
  */
 void draw_status_bar(struct appendBuffer *obj) {
     append_to_append_buffer(obj, "\x1b[7m", 4); // inverts colours (m command is the "Select Graphic Rendition" condition)
@@ -583,7 +596,7 @@ void draw_status_bar(struct appendBuffer *obj) {
 } 
 
 /**
- * 
+ * Displays message bar at the bottom of window
  */
 void draw_message_bar(struct appendBuffer *obj) {
     append_to_append_buffer(obj, "\x1b[K", 3); // Clears message bar
@@ -617,6 +630,25 @@ int row_character_index_to_render_index(editorRow *row, int characterX) {
     }
 
     return renderX;
+}
+
+/**
+ * Converts the index in terms of the render array to the cursor index in ters of the characters array
+ */
+int row_render_index_to_character_index(editorRow *row, int renderX) {
+    int currentRenderX = 0;
+    int characterX;
+    for (characterX = 0; characterX < row->size; characterX++) {
+        if (row->characters[characterX] == '\t') {
+            currentRenderX += (TAB_STOP - 1) - (currentRenderX % TAB_STOP);
+        }
+        currentRenderX++;
+
+        if (currentRenderX > renderX) {
+            return characterX;
+        }
+    }
+    return characterX;
 }
 
 /**
@@ -768,7 +800,7 @@ void move_cursor(int input) {
 }
 
 /**
- * 
+ * Called when character is typed
  */
 void insert_character(int character) {
     if (eConfig.characterY == eConfig.numRows) { // If we are at the end of the file, we need to add a new row.
@@ -779,7 +811,7 @@ void insert_character(int character) {
 }
 
 /**
- * 
+ * Called when newline (ENTER, etc) is pressed
  */
 void insert_new_line() {
     if (eConfig.characterX == 0) { // If we are at begining of line, insert blank lie before row we were on
@@ -797,7 +829,7 @@ void insert_new_line() {
 }
 
 /**
- * 
+ * Called when DELETE, etc. is pressed
  */
 void delete_character() {
     if (eConfig.characterY == eConfig.numRows) { // Cursor past end of file, nothing to delete
@@ -848,6 +880,10 @@ void process_key_press() {
 
         case CTRL_KEY('s'):
             save();
+            break;
+        
+        case CTRL_KEY('f'):
+            find();
             break;
         
         case BACKSPACE:
@@ -937,7 +973,7 @@ void free_append_buffer(struct appendBuffer *obj) {
 }
 
 /**
- * 
+ * Converts all of the rows in the rows parameter of the editorConfiguration object to a string
  */
 char *rows_to_string(int *bufferLength) {
     int totalLength = 0;
@@ -964,11 +1000,11 @@ char *rows_to_string(int *bufferLength) {
 } 
 
 /**
- *
+ * Saves all changes made to the file onto the disk 
  */  
 void save() {
     if (eConfig.fileName == NULL) {
-        eConfig.fileName = prompt("Save as: %s (ESC to cancel)");
+        eConfig.fileName = prompt("Save as: %s (ESC to cancel)", NULL);
         if (eConfig.fileName == NULL) {
             set_status_message("Save canceled");
             return;
@@ -998,5 +1034,80 @@ void save() {
 
     free(buf);
     set_status_message("Can't save to disk! I/O error: %s", strerror(errno));
+}
+
+/**
+ * Finds occurences of query
+ */
+void find_callback(char *query, int key) {
+    static int lastMatch = -1;
+    static int direction = 1;
+
+    if (key == '\x1b' || key == '\r') { // Pressing enter or escape leaves mode
+        lastMatch = -1;
+        direction = 1;
+        return;
+    } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+        direction = 1;
+    } else if (key == ARROW_LEFT || key == ARROW_UP) {
+        direction = -1;
+    } else {
+        lastMatch = -1;
+        direction = 1;
+    }
+
+    if (lastMatch == -1) {
+        direction = 1;
+    }
+    int current = lastMatch; // Index of the current row we are searching in the "row" parameter
+
+    for (int i = 0; i < eConfig.numRows; i++) {
+        current += direction;
+        if (current == -1) { // If at top of file, go to bottom
+            current = eConfig.numRows - 1;
+        } else if (current == eConfig.numRows) { // If at end of file, go to beginning
+            current = 0;
+        }
+
+        editorRow *row = &eConfig.row[current];
+
+        char *match = strstr(row->render, query); // Finds first occurence of substring (needle [second param]) in the string (haystack [first param])
+        if (match) {
+            lastMatch = current;
+            eConfig.characterY = current;
+            eConfig.characterX = row_render_index_to_character_index(row, match - row->render);
+            eConfig.rowOffset = current - 10;
+            if (current - 10 < 0) {
+                eConfig.rowOffset = 0;
+            }
+            break;
+        }
+    }
+}
+
+/**
+ * Used to handle case when Ctrl-F is pressed
+ */
+void find() {
+    // Save initial cursor location
+    int savedCharacterX = eConfig.characterX;
+    int savedCharacterY = eConfig.characterY;
+    int savedColOff = eConfig.colOffset;
+    int savedRowOff = eConfig.rowOffset;
+
+    // Get query
+    char *query = prompt("Search %s (ESC to exit | Arrows to navigate)", find_callback);
+    
+    // If query exists, free it from heap, else restore previous cursor position
+    if (query) {
+        free(query);
+    } else {
+        eConfig.characterX = savedCharacterX;
+        eConfig.characterY = savedCharacterY;
+        eConfig.rowOffset = savedRowOff;
+        eConfig.colOffset = savedColOff;
+    }
+
+    set_status_message("Exited Search Mode");
 }
 
