@@ -22,6 +22,9 @@
 #define APPEND_BUFFER_INIT {NULL, 0} // Default constructor for appendBuffer structure
 #define PROGRAM_VERSION "0.0.1"
 #define TAB_STOP 8
+#define HL_HIGHLIGHT_NUMBERS (1 << 0)
+#define HL_HIGHLIGHT_STRINGS (1 << 1)
+#define HLDB_ENTRIES (sizeof(HLDB)/sizeof(HLDB[0])) // stores length of HLDB array
 
 #define QUIT_TIMES 2
 
@@ -31,7 +34,17 @@ typedef struct editorRow {
     char *render; // This contains the text that will be displayed
     int size;
     char *characters;
-} editorRow;  
+    unsigned char *highlight;
+} editorRow;
+
+// Stores code syntax type
+struct editorSyntax {
+    char *filetype;
+    char **filematch;
+    char *singlelineCommentStart;
+    char **keywords;
+    int flags;
+};
 
 // Stores the configuration of the terminal and editor
 struct editorConfiguration {
@@ -45,6 +58,7 @@ struct editorConfiguration {
     int unsavedChanges;
     time_t statusMessageTime;
     editorRow *row;
+    struct editorSyntax *syntax;
     struct termios original_termios; 
 };
 
@@ -67,6 +81,35 @@ enum customKeyValues {
     HOME_KEY,
     END_KEY,
     DELETE_KEY
+};
+
+enum editorHighlight {
+    HL_NORMAL = 0,
+    HL_NUMBER,
+    HL_SEARCH_RESULT,
+    HL_STRING,
+    HL_COMMENT,
+    HL_KEYWORD1, // Primary
+    HL_KEYWORD2 // Secondary
+};
+
+char *C_HL_extensions[] = {".c", ".h", ".cpp", ".hpp", NULL};
+char *C_HL_keywords[] = {
+    "switch", "if", "while", "for", "break", "continue", "return", "else", "struct", "union", "typedef", "static", "enum", "class", "case", // Primary keywords
+    
+    "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|", // Secondary keywords
+    
+    NULL 
+};
+
+struct editorSyntax HLDB[] = {
+    {
+        "c",
+        C_HL_extensions,
+        "//",
+        C_HL_keywords,
+        HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+    }
 };
 
 // Functions declared here in the exact order with which they are defined
@@ -102,9 +145,13 @@ void process_key_press();
 void append_to_append_buffer(struct appendBuffer*, const char*, int);
 void free_append_buffer(struct appendBuffer*);
 char *rows_to_string(int*);
+void update_syntax(editorRow*);
+int syntax_to_colour(int);
+void select_syntax_highlight();
 void save();
 void find_callback(char*, int);
 void find();
+int is_separator(int);
 
 int main(int argc /* Argument count */, char ** argv /* Argument values */) {
     enable_raw_mode(); // Before doing anything else, we must put terminal in correct mode
@@ -139,6 +186,7 @@ void init() {
     eConfig.statusMessage[0] = '\0';
     eConfig.statusMessageTime = 0;
     eConfig.unsavedChanges = 0; // Tells editor if file is modified
+    eConfig.syntax = NULL;
 
     if (get_window_size(&eConfig.windowRows, &eConfig.windowCols) == -1) {
         safe_exit("get_window_size");
@@ -158,6 +206,8 @@ void open_file(char *fileName) {
     }
     free(eConfig.fileName);
     eConfig.fileName = strdup(fileName); // strdup() copies given string and allocates memory (assumes that we will free it later)
+
+    select_syntax_highlight();
 
     // Gets te 
     char *line = NULL;
@@ -253,6 +303,7 @@ void insert_row(int index, char *rowValue, size_t length) {
 
     eConfig.row[index].rsize = 0;
     eConfig.row[index].render = NULL;
+    eConfig.row[index].highlight = NULL;
     update_row(&eConfig.row[index]);   
 }
 
@@ -286,6 +337,8 @@ void update_row(editorRow *row) {
 
     row->render[index] = '\0';
     row->rsize = index;
+
+    update_syntax(row);
 }
 
 /**
@@ -294,6 +347,7 @@ void update_row(editorRow *row) {
 void free_row(editorRow *row) {
     free(row->render);
     free(row->characters);
+    free(row->highlight);
 }
 
 /**
@@ -554,7 +608,39 @@ void draw_rows(struct appendBuffer *obj) {
             if (length > eConfig.windowCols) {
                 length = eConfig.windowCols;
             }
-            append_to_append_buffer(obj, &eConfig.row[fileRow].render[eConfig.colOffset], length);
+
+            char *s = &eConfig.row[fileRow].render[eConfig.colOffset];
+            unsigned char *hl = &eConfig.row[fileRow].highlight[eConfig.colOffset];
+            int currentColour = -1;
+            for (int i = 0; i < length; i++) {
+                if (iscntrl(c[i])) { // Handles non-printable characters
+                    char sym = (c[i] < 26) ? '@' + c[j] : '?';
+                    append_to_append_buffer(obj, "\x1b[7m", 4); // Highlight colour white
+                    append_to_append_buffer(obj, &sym, 1);
+                    append_to_append_buffer(obj, "\x1b[m", 3); // Set colour back to normal
+                    if (currentColour != -1) { // Set colour back to original
+                        char buf[16];
+                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", currentColour); 
+                        append_to_append_buffer(obj, buf, clen);
+                    }
+                } else if (hl[i] == HL_NORMAL) {
+                    if (currentColour != -1) { // Only change colour if previous colour is not HL_NORMAL
+                        append_to_append_buffer(obj, "\x1b[39m", 5); // Set colour back to normal
+                        currentColour = -1;
+                    }
+                    append_to_append_buffer(obj, &s[i], 1);
+                } else {
+                    int colour = syntax_to_colour(hl[i]);
+                    if (colour != currentColour) { // Only change colour if previous colour is not HL_NORMAL
+                        currentColour = colour;
+                        char buf[16];
+                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", colour); // Use snprintf to write escape sequence into buffer that will be passed into append_to_append_buffer()
+                        append_to_append_buffer(obj, buf, clen);
+                    }
+                    append_to_append_buffer(obj, &s[i], 1);
+                }
+            }
+            append_to_append_buffer(obj, "\x1b[39m", 5);
         }
 
         // \x1b is the escape character (27 in decimal). [0K are the remaining three bytes. We are using the K command (Erase in Line). The 0 says clear to the right of the cursor. 
@@ -572,11 +658,10 @@ void draw_status_bar(struct appendBuffer *obj) {
     // Prepares string to be printed
     char status[80], renderStatus[80];
     int length = snprintf(status, sizeof(status), "%.20s - %d lines %s", eConfig.fileName ? eConfig.fileName : "[No Name]", eConfig.numRows, eConfig.unsavedChanges != 0 ? "(modified)" : "");
+    int renderLength = snprintf(renderStatus, sizeof(renderStatus), "%s | %d/%d", eConfig.syntax ? eConfig.syntax->filetype : "no file type", eConfig.characterY + 1, eConfig.numRows);
     if (length > eConfig.windowCols) {
         length = eConfig.windowCols;
     }
-
-    int renderLength = snprintf(renderStatus, sizeof(renderStatus), "%d:%d", eConfig.characterY + 1, eConfig.numRows);
 
     // Adds string
     append_to_append_buffer(obj, status, length);
@@ -1000,6 +1085,153 @@ char *rows_to_string(int *bufferLength) {
 } 
 
 /**
+ * Updates the highlight array to contain colours of characters
+ */
+void update_syntax(editorRow *row) {
+    row->highlight = realloc(row->highlight, row->size); // In case row grew in size before last call
+    memset(row->highlight, HL_NORMAL, row->rsize); // Sets memory
+
+    if (eConfig.syntax == NULL) {
+        return;
+    }
+
+    char **keywords = eConfig.syntax->keywords;
+
+    char *scs = eConfig.syntax->singlelineCommentStart;
+    int scsLen = scs ? strlen(scs) : 0;
+    
+    int previousSeparator = 1; // Consider begining of line as separator
+    int inString = 0;
+
+    int i = 0;
+    while (i < row->size) {
+        char c = row->render[i];
+        unsigned char prevHighlight = (i > 0) ? row->highlight[i - 1] : HL_NORMAL;
+
+        if (scsLen && !inString) { // Checks is we are not within quotations
+            if (!strncmp(&row->render[i], scs, scsLen)) { // Checks if string is present in line
+                memset(&row->highlight[i], HL_COMMENT, row->rsize - i); // Colours
+                break; // At end of line so we exit loop
+            }
+        }
+
+        if (eConfig.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+            if (inString) {
+                row->highlight[i] = HL_STRING;
+                if (c == inString) { // Check if current character is closing quotation
+                    inString = 0;
+                }
+                i++;
+                previousSeparator = 1;
+                continue;
+            } else {
+                if (c == '"' || c == '\'' || c == '\"') {
+                    inString = c;
+                    row->highlight[i] = HL_STRING;
+                    i++;
+                    continue;
+                }
+            }
+        }
+        
+        if (eConfig.syntax->flags & HL_HIGHLIGHT_NUMBERS) { // Checks if numbers should be highighted for the current file type
+            if (isdigit(c) && (previousSeparator || prevHighlight == HL_NUMBER) || (c == '.' && prevHighlight == HL_NUMBER)) { // If number, use number highlighting
+                row->highlight[i] = HL_NUMBER;
+                i++;
+                previousSeparator = 0;
+                continue;
+            }
+        } 
+
+        if (previousSeparator) { // Check if previous character was a separator
+            int j;
+            for (j = 0; keywords[j]; j++) { // Go through all available keywords until match is found
+                int keywordLen = strlen(keywords[j]);
+                
+                // Checks if secondary keyword and if so, remove '|'
+                int keyword2 = (keywords[j][keywordLen - 1] == '|'); 
+                if (keyword2) {
+                    keywordLen--;
+                }
+
+                if (!strncmp(&row->render[i], keywords[j], keywordLen) /* Does keyword exist? */ && is_separator(row->render[i + keywordLen]) /* Is there a separator directly after keyword */) {
+                    memset(&row->highlight[i], keyword2 ? HL_KEYWORD2 : HL_KEYWORD1, keywordLen);
+                    i+= keywordLen;
+                    break;
+                }
+            }
+
+            if (keywords[j] != NULL) {
+                previousSeparator = 0;
+                continue;
+            }
+        }
+        
+        previousSeparator = is_separator(c);
+        i++;
+    }
+}
+
+/**
+ * Returns the colour of a character
+ */
+int syntax_to_colour(int highlightValue) {
+    switch (highlightValue) {
+        case HL_NUMBER:
+            return 31;
+
+        case HL_SEARCH_RESULT:
+            return 34;
+
+        case HL_STRING:
+            return 35;
+
+        case HL_COMMENT:
+            return 36;
+
+        case HL_KEYWORD1:
+            return 33;
+        
+        case HL_KEYWORD2:
+            return 32;
+
+        default:
+            return 37;
+    }
+} 
+
+/**
+ * 
+ */
+void select_syntax_highlight() {
+    eConfig.syntax = NULL;
+
+    if (eConfig.fileName == NULL) {
+        return;
+    }
+
+    char *extension = strrchr(eConfig.fileName, '.'); // Get pointer to extensions part of the filename
+
+    for (int i = 0; i < HLDB_ENTRIES; i++) { // Loop through each editor syntax 
+        struct editorSyntax *s = &HLDB[i];
+        unsigned int j = 0;
+        while (s->filematch[j]) { // Loop through each pattern in filematch array
+            int isExtension = (s->filematch[j][0] == '.'); // Checks if file extension exists
+            if ((isExtension && extension && !strcmp(extension, s->filematch[j])) || (!isExtension && strstr(eConfig.fileName, s->filematch[j]) /* If no file extension, sees if character sequence appears in filename at all */)) {
+                eConfig.syntax = s;
+
+                for (int fileRow = 0; fileRow < eConfig.numRows; fileRow++) {
+                    update_syntax(&eConfig.row[fileRow]);
+                }
+
+                return;
+            }
+            j++;
+        }
+    }
+}
+
+/**
  * Saves all changes made to the file onto the disk 
  */  
 void save() {
@@ -1009,6 +1241,7 @@ void save() {
             set_status_message("Save canceled");
             return;
         }
+        select_syntax_highlight();
     }
 
     int length;
@@ -1042,6 +1275,15 @@ void save() {
 void find_callback(char *query, int key) {
     static int lastMatch = -1;
     static int direction = 1;
+
+    static int savedHighlightLine;
+    static char *savedHighlight = NULL;
+
+    if (savedHighlight) { // Restores colours to default
+        memcpy(eConfig.row[savedHighlightLine].highlight, savedHighlight, eConfig.row[savedHighlightLine].rsize);
+        free(savedHighlight);
+        savedHighlight = NULL;
+    }
 
     if (key == '\x1b') { // Pressing enter or escape leaves mode
         lastMatch = -1;
@@ -1080,6 +1322,14 @@ void find_callback(char *query, int key) {
             if (current - 10 < 0) {
                 eConfig.rowOffset = 0;
             }
+
+            // Before highlighting match we must save the current row
+            savedHighlightLine = current;
+            savedHighlight = malloc(row->size);
+            memcpy(savedHighlight, row->highlight, row->rsize); 
+            
+            memset(&row->highlight[match - row->render], HL_SEARCH_RESULT, strlen(query)); // Highlights matches
+
             break;
         }
     }
@@ -1109,5 +1359,12 @@ void find() {
     }
 
     set_status_message("Exited Search Mode");
+}
+
+/**
+ * Determines if character separates words
+ */
+int is_separator(int c) {
+    return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
 }
 
