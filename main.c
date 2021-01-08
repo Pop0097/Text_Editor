@@ -213,7 +213,7 @@ char *prompt(char *promp, void (*func)(char*, int)) {
             if (bufferLength != 0) {
                 set_status_message("");
                 if (func) {
-                    func(buf, input);
+                    func(buf, '\x1b');
                 }
                 return buf;
             }
@@ -1043,7 +1043,7 @@ void find_callback(char *query, int key) {
     static int lastMatch = -1;
     static int direction = 1;
 
-    if (key == '\x1b' || key == '\r') { // Pressing enter or escape leaves mode
+    if (key == '\x1b') { // Pressing enter or escape leaves mode
         lastMatch = -1;
         direction = 1;
         return;
