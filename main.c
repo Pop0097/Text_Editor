@@ -30,6 +30,8 @@
 
 // Stores a row of text
 typedef struct editorRow {
+    int index;
+    int highlightOpenComment;
     int rsize;
     char *render; // This contains the text that will be displayed
     int size;
@@ -41,8 +43,10 @@ typedef struct editorRow {
 struct editorSyntax {
     char *filetype;
     char **filematch;
-    char *singlelineCommentStart;
     char **keywords;
+    char *singlelineCommentStart;
+    char *mlCommentStart;
+    char *mlCommentEnd;
     int flags;
 };
 
@@ -90,7 +94,8 @@ enum editorHighlight {
     HL_STRING,
     HL_COMMENT,
     HL_KEYWORD1, // Primary
-    HL_KEYWORD2 // Secondary
+    HL_KEYWORD2, // Secondary
+    HL_MLCOMMENT // Multi-line comment
 };
 
 char *C_HL_extensions[] = {".c", ".h", ".cpp", ".hpp", NULL};
@@ -106,8 +111,10 @@ struct editorSyntax HLDB[] = {
     {
         "c",
         C_HL_extensions,
-        "//",
         C_HL_keywords,
+        "//",
+        "/*",
+        "*/",
         HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
     }
 };
@@ -293,6 +300,11 @@ void insert_row(int index, char *rowValue, size_t length) {
 
     eConfig.row = realloc(eConfig.row, sizeof(editorRow) * (eConfig.numRows + 1));
     memmove(&eConfig.row[index + 1], &eConfig.row[index], sizeof(editorRow) * (eConfig.numRows - index));
+    for (int i = index + 1; i <= eConfig.numRows; i++) {
+        eConfig.row[i].index++;
+    }
+
+    eConfig.row[index].index = index;
 
     eConfig.row[index].size = length;
     eConfig.row[index].characters = malloc(length + 1);
@@ -304,6 +316,7 @@ void insert_row(int index, char *rowValue, size_t length) {
     eConfig.row[index].rsize = 0;
     eConfig.row[index].render = NULL;
     eConfig.row[index].highlight = NULL;
+    eConfig.row[index].highlightOpenComment = 0;
     update_row(&eConfig.row[index]);   
 }
 
@@ -360,6 +373,9 @@ void delete_row(int index) {
 
     free_row(&eConfig.row[index]); // Clears buffers in row
     memmove(&eConfig.row[index], &eConfig.row[index + 1], sizeof(editorRow) * (eConfig.numRows - index - 1)); // Move memory of previous row to the recently deleted.
+    for (int i = index; i < eConfig.numRows - 1; i++) {
+        eConfig.row[i].index--;
+    }
     eConfig.numRows--;
     eConfig.unsavedChanges++;
 }
@@ -613,8 +629,8 @@ void draw_rows(struct appendBuffer *obj) {
             unsigned char *hl = &eConfig.row[fileRow].highlight[eConfig.colOffset];
             int currentColour = -1;
             for (int i = 0; i < length; i++) {
-                if (iscntrl(c[i])) { // Handles non-printable characters
-                    char sym = (c[i] < 26) ? '@' + c[j] : '?';
+                if (iscntrl(s[i])) { // Handles non-printable characters
+                    char sym = (s[i] < 26) ? '@' + s[i] : '?';
                     append_to_append_buffer(obj, "\x1b[7m", 4); // Highlight colour white
                     append_to_append_buffer(obj, &sym, 1);
                     append_to_append_buffer(obj, "\x1b[m", 3); // Set colour back to normal
@@ -1098,20 +1114,47 @@ void update_syntax(editorRow *row) {
     char **keywords = eConfig.syntax->keywords;
 
     char *scs = eConfig.syntax->singlelineCommentStart;
+    char *mcs = eConfig.syntax->mlCommentStart;
+    char *mce = eConfig.syntax->mlCommentEnd;
+
     int scsLen = scs ? strlen(scs) : 0;
+    int mcsLen = mcs ? strlen(mcs) : 0;
+    int mceLen = mce ? strlen(mce) : 0;
     
     int previousSeparator = 1; // Consider begining of line as separator
     int inString = 0;
+    int inComment = (row->index > 0 && eConfig.row[row->index - 1].highlightOpenComment); // True if row has a multiline comment
 
     int i = 0;
     while (i < row->size) {
         char c = row->render[i];
         unsigned char prevHighlight = (i > 0) ? row->highlight[i - 1] : HL_NORMAL;
 
-        if (scsLen && !inString) { // Checks is we are not within quotations
+        if (scsLen && !inString && !inComment) { // Checks is we are not within quotations
             if (!strncmp(&row->render[i], scs, scsLen)) { // Checks if string is present in line
                 memset(&row->highlight[i], HL_COMMENT, row->rsize - i); // Colours
                 break; // At end of line so we exit loop
+            }
+        }
+
+        if (mcsLen && mceLen && !inString) { // Ensures parameters are defined
+            if (inComment) { // Sees if we are in comment
+                row->highlight[i] = HL_MLCOMMENT; // Sets highlight colour
+                if (!strncmp(&row->render[i], mce, mceLen)) { // If we are at the end of the comment
+                    memset(&row->highlight[i], HL_MLCOMMENT, mceLen); 
+                    i += mceLen;
+                    inComment = 0;
+                    previousSeparator = 1;
+                    continue;
+                } else { 
+                    i++;
+                    continue;
+                } 
+            } else if (!strncmp(&row->render[i], mcs, mcsLen)) { // If we have reached the start of a ML comment
+                memset(&row->highlight[i], HL_MLCOMMENT, mcsLen);
+                i += mcsLen;
+                inComment = 1;
+                continue;
             }
         }
 
@@ -1170,6 +1213,13 @@ void update_syntax(editorRow *row) {
         previousSeparator = is_separator(c);
         i++;
     }
+
+    // Tells us if multicomment is closed in this row or if it continues
+    int changed = (row->highlightOpenComment != inComment);
+    row->highlightOpenComment = inComment;
+    if (changed && row->index + 1 < eConfig.numRows) { // If comment status changed, update syntax for all rows 
+        update_syntax(&eConfig.row[row->index + 1]);
+    }
 }
 
 /**
@@ -1187,6 +1237,7 @@ int syntax_to_colour(int highlightValue) {
             return 35;
 
         case HL_COMMENT:
+        case HL_MLCOMMENT:
             return 36;
 
         case HL_KEYWORD1:
